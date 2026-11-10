@@ -1,6 +1,7 @@
 """Run the same host, RTL and Xilinx 7-series synthesis checks locally and in CI."""
 
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import sys
 import zlib
 
 from uart_rect import encode_rect
+from npu_model import write_vectors
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -40,10 +42,10 @@ def run(label, command, log_name, timeout=120):
     if result.returncode:
         print(output[-12000:], file=sys.stderr)
         raise RuntimeError(f"{label} failed (exit {result.returncode}); full log: build/{log_name}")
-    if label != "Xilinx 7-series synthesis":
+    if not label.endswith("synthesis"):
         print(output.strip(), flush=True)
     else:
-        print("PASS synth_xilinx + check -assert; full report: build/synthesis.log", flush=True)
+        print(f"PASS synth_xilinx + check -assert; full report: build/{log_name}", flush=True)
     return output
 
 
@@ -102,7 +104,7 @@ def main():
     (BUILD / "check-summary.json").unlink(missing_ok=True)
     try:
         iverilog, vvp, yosys = (find_tool(name) for name in ["iverilog", "vvp", "yosys"])
-        run("Python protocol tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        run("Python tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
             "python-tests.log")
         packets = encode_rect(240, 140, 160, 80, 0x1C) + encode_rect(160, 120, 320, 240, 0x1F)
         (BUILD / "uart_packets.mem").write_text("\n".join(f"{byte:02x}" for byte in packets) + "\n",
@@ -119,10 +121,55 @@ def main():
                      + " check -assert; stat; write_json build/gpu_top.json")
         run("Xilinx 7-series synthesis", [yosys, "-Q", "-T", "-p", synthesis], "synthesis.log", timeout=300)
         preview(args.update_preview)
+
+        matrix_cases = write_vectors(BUILD / "npu_cases.txt")
+        npu_sources = [path.relative_to(ROOT).as_posix() for path in sorted((ROOT / "rtl/npu").glob("*"))
+                       if path.suffix in {".v", ".sv"}]
+        npu_benches = [("tb_npu_pe", "pe", []), ("tb_npu_array", "array", []),
+                       ("tb_npu_top", "top_4x4", []),
+                       ("tb_npu_top", "top_2x2", ["-Ptb_npu_top.LANES=2"])]
+        for bench, variant, parameters in npu_benches:
+            binary = f"build/npu_{variant}.vvp"
+            run(f"Compile NPU {variant}", [iverilog, "-g2012", "-Wall", "-s", bench, *parameters,
+                "-o", binary, *npu_sources, f"tests/npu/{bench}.sv"], f"npu_{variant}-compile.log")
+            run(f"NPU {variant}", [vvp, binary], f"npu_{variant}.log")
+        npu_synthesis = ("read_verilog -sv " + " ".join(npu_sources)
+                         + "; hierarchy -check -top npu_top; synth_xilinx -family xc7 -top npu_top;"
+                         + " check -assert; stat; write_json build/npu_top.json")
+        run("NPU Xilinx 7-series synthesis", [yosys, "-Q", "-T", "-p", npu_synthesis],
+            "npu-synthesis.log", timeout=300)
+        modules = json.loads((BUILD / "npu_top.json").read_text(encoding="utf-8"))["modules"]
+
+        def count_cells(module_name):
+            result = Counter()
+            for cell in modules[module_name].get("cells", {}).values():
+                kind = cell["type"]
+                child = modules.get(kind, {})
+                attributes = child.get("attributes", {})
+                # Xilinx primitives may contain timing/specify cells in JSON.
+                # Count the primitive itself, not its simulation internals.
+                primitive = any(int(str(attributes.get(flag, "0")), 2)
+                                for flag in ("blackbox", "whitebox"))
+                if not primitive and child.get("cells"):
+                    result.update(count_cells(kind))
+                else:
+                    result[kind] += 1
+            return result
+
+        resources = count_cells("npu_top")
+        dsp = resources["DSP48E1"]
+        bram18 = resources["RAMB18E1"]
+        bram36 = resources["RAMB36E1"]
+        if not (0 < dsp <= 16) or bram18 + bram36 == 0:
+            raise RuntimeError(f"NPU mapping expected DSP MACs and block RAM, got {dict(resources)}")
+        print(f"PASS NPU mapping: {dsp} DSP48E1, {bram18} RAMB18E1, {bram36} RAMB36E1", flush=True)
         summary = {"python_tests": "passed", "rtl_testbenches": benches,
                    "checked_frames": 3, "pixels_per_frame": 307200,
                    "synthesis": "synth_xilinx -family xc7; check -assert",
-                   "hardware_validation": "not performed"}
+                   "hardware_validation": "not performed",
+                   "npu": {"matrix_cases_per_configuration": matrix_cases, "lanes_tested": [2, 4],
+                           "arithmetic": "signed INT8 x INT8 -> INT32",
+                           "dsp48e1": dsp, "ramb18e1": bram18, "ramb36e1": bram36}}
         (BUILD / "check-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print("\nAll checks passed. Results: build/check-summary.json", flush=True)
         return 0

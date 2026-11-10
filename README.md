@@ -3,9 +3,9 @@
 [![CI](https://github.com/henshenry2026-lab/xilinx-gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/henshenry2026-lab/xilinx-gpu/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-一个从小型 2D 图形核开始的 FPGA GPU 学习项目：**PC 通过 UART 改变矩形，FPGA 每个像素周期计算颜色并输出视频时序**。
+一个从小型 2D 图形核开始、逐步加入端侧模型计算的 FPGA 项目：**GPU 通过 UART 控制矩形；NPU 用 INT8 脉动阵列执行矩阵乘法**。
 
-核心使用可综合 Verilog，面向 Xilinx 7 系列。v1 支持一个实心矩形、黑色背景、RGB332、640×480 视频输出。项目已包含可重复运行的主机测试、RTL 仿真和综合检查，方便在此基础上继续实现精灵、帧缓冲或光栅化。
+核心使用可综合 Verilog / SystemVerilog，面向 Xilinx 7 系列。GPU 支持一个实心矩形、黑色背景、RGB332、640×480 视频输出；新增 NPU 提供 **4×4 INT8 乘加阵列、INT32 输出、分银行 BRAM 和多块矩阵调度**。项目包含可重复运行的 Python 测试、RTL 仿真和综合检查。
 
 ![真实 RTL 仿真生成的 640×480 画面](docs/demo.png)
 
@@ -13,7 +13,7 @@
 
 ## 快速运行
 
-需要 Python **3.10+**、Icarus Verilog（`iverilog`、`vvp`）和 Yosys。仿真、协议测试与图片生成只使用 Python 标准库。
+需要 Python **3.10+**、Icarus Verilog（`iverilog`、`vvp`）和 Yosys。参考模型、测试与图片生成只使用 Python 标准库。
 
 ```sh
 git clone https://github.com/henshenry2026-lab/xilinx-gpu.git
@@ -43,7 +43,18 @@ python tools/check.py
 
 生成内容位于被 Git 忽略的 `build/`：仿真日志、综合报告、综合后 JSON 网表、`demo.ppm`、`demo.png` 和 `check-summary.json`。有意修改演示场景后，使用 `python tools/check.py --update-preview` 刷新 README 图片。
 
-## 模块与“存、算”
+## NPU 矩阵计算
+
+`npu_top` 计算 `C[M,N] = A[M,K] × B[K,N]`，默认支持 `M,N≤16`、`K≤64`，可运行非方阵和不足 4×4 的尾块。输入是有符号 INT8，结果是未经缩放的 INT32；输出带行列标签并支持反压。A、B 各有 1 KiB 逻辑存储，空闲时装载，计算期间由 4×4 阵列复用。
+
+```sh
+python tools/npu_model.py    # 显示参考结果与固定步长写地址
+python tools/check.py        # GPU + NPU 的统一检查入口
+```
+
+设计借鉴 hls4ml / FINN 的量化与并行复用、Google TPU 的脉动阵列，以及 Snowflake / Angel-Eye 的存算组织。详见 [NPU 架构、接口、验证和参考资料](docs/npu.md)。这是面向未来端侧小模型和 JEPA 研究的矩阵内核；板级传输和完整模型执行留待后续实现。
+
+## GPU 模块与“存、算”
 
 ```mermaid
 flowchart LR
@@ -140,30 +151,37 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 - 场景：参数原子提交、后到覆盖、提交与新命令同拍、矩形四边及消隐。
 - 集成：经真实串行比特流控制，逐像素检查连续 **3 帧、共 1,260,000 个扫描周期**；每帧 307,200 个活动像素、50,400 个 HS 低电平周期、1,600 个 VS 低电平周期。
 - 综合：`synth_xilinx -family xc7`，随后执行 `check -assert`。
+- NPU：5 项 Python 参考模型测试、PE/阵列自检查，以及 **29 组矩阵分别在 4×4、2×2 配置**下与整数参考结果比较；检查极值、尾块、反压、错误输入和复位恢复。
+- NPU 综合：独立综合 `npu_top`，检查 DSP 与 BRAM 映射并运行 `check -assert`。
 
-2026-11-10 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。该次映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；不同综合版本和布局结果可能变化。完整统计见本地 `build/synthesis.log` 或 CI 下载的验证产物。
+2026-11-10 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。GPU 映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；默认 4×4 NPU 映射到 **16 个 DSP48E1、8 个 RAMB18E1**。不同综合版本和布局结果可能变化。完整统计见本地 `build/synthesis.log`、`build/npu-synthesis.log` 或 CI 验证产物。
 
 **尚未完成：**Vivado 布局布线/时序收敛、实际 FPGA 下载、显示器和串口的硬件验证。当前结果证明功能仿真和 7 系列逻辑综合通过。
 
 ## 项目结构
 
 ```text
-rtl/                  6 个功能模块与 gpu_top
+rtl/                  GPU 的 6 个功能模块与 gpu_top
+rtl/npu/              PE、脉动阵列、分银行缓存与 npu_top
 tests/rtl/            4 个自检查 SystemVerilog 测试台
+tests/npu/            NPU 的 PE、阵列、任务级测试台
 tests/test_uart_rect.py
+tests/test_npu_model.py
 tools/uart_rect.py    UART 编码与发送 CLI
-tools/check.py        跨平台验证与预览生成
+tools/npu_model.py    整数参考模型、写地址打包与测试向量
+tools/check.py        GPU + NPU 跨平台验证与预览生成
 docs/demo.png         从真实 RTL 输出生成的演示图
+docs/npu.md           NPU 接口、存算组织与参考资料
 .github/workflows/    同入口 CI
 ```
 
-后续可在这个基础上逐步加入多矩形/精灵、BRAM 帧缓冲、画线和三角形光栅化。首版集中验证“控制命令 → 参数存储 → 像素计算 → 视频扫描”这条通路。
+后续可加入 GPU 的多矩形/帧缓冲，并在 NPU 上逐步补齐量化线性层与数据搬运，验证 JEPA 编码器或预测器所需的算子。
 
 ## English overview
 
-A small synthesizable 2D graphics core for Xilinx 7-series FPGAs. A Python CLI sends CRC-protected UART commands; the FPGA stores one rectangle and computes RGB332 pixels at 640×480, approximately 60 Hz. Scene updates commit atomically at vertical blanking. No framebuffer, BRAM or DSP is required by v1.
+A small synthesizable GPU/NPU learning project for Xilinx 7-series FPGAs. The GPU draws one UART-controlled rectangle at 640×480 with atomic scene updates. The independent NPU computes signed INT8 matrix products using a 4×4 output-stationary systolic array, INT32 accumulators and banked BRAM. Default jobs support M/N up to 16 and K up to 64, with tagged results and backpressure.
 
-Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It runs host tests, four self-checking RTL benches, three complete video frames and Xilinx 7-series synthesis. The README image is generated from the actual simulated pixel stream. Physical board integration, Vivado timing closure and hardware validation remain to be done once the board is identified.
+Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, NPU PE/array behavior, 29 GEMMs on both 4×4 and 2×2 configurations, and Xilinx synthesis of both cores. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
 
 ## 许可证
 
