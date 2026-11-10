@@ -1,0 +1,2 @@
+# Optional: only needed to send commands to a physical UART.
+pyserial==3.5
