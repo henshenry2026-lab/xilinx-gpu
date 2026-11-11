@@ -45,10 +45,11 @@ python tools/check.py
 
 ## NPU 矩阵计算
 
-`npu_top` 计算 `C[M,N] = A[M,K] × B[K,N]`，默认支持 `M,N≤16`、`K≤64`，可运行非方阵和不足 4×4 的尾块。输入是有符号 INT8，结果是未经缩放的 INT32；输出带行列标签并支持反压。A、B 各有 1 KiB 逻辑存储，空闲时装载，计算期间由 4×4 阵列复用。
+`npu_top` 计算 `C[M,N] = A[M,K] × B[K,N]`，默认支持 `M,N≤16`、`K≤64`，可运行非方阵和不足 4×4 的尾块。输入是有符号 INT8，结果是 INT32；输出带行列标签并支持反压。`npu_linear_top` 在 GEMM 后增加逐通道 INT32 bias、ties-away 定点重定标、可选 ReLU 和 INT8 饱和。两种顶层都可以独立使用；缺参会拒绝启动，非法 scale 写入会报告错误。
 
 ```sh
 python tools/npu_model.py    # 显示参考结果与固定步长写地址
+python -m unittest tests/test_npu_model.py -v  # 检查定点参考模型
 python tools/check.py        # GPU + NPU 的统一检查入口
 ```
 
@@ -151,10 +152,10 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 - 场景：参数原子提交、后到覆盖、提交与新命令同拍、矩形四边及消隐。
 - 集成：经真实串行比特流控制，逐像素检查连续 **3 帧、共 1,260,000 个扫描周期**；每帧 307,200 个活动像素、50,400 个 HS 低电平周期、1,600 个 VS 低电平周期。
 - 综合：`synth_xilinx -family xc7`，随后执行 `check -assert`。
-- NPU：5 项 Python 参考模型测试、PE/阵列自检查，以及 **29 组矩阵分别在 4×4、2×2 配置**下与整数参考结果比较；检查极值、尾块、反压、错误输入和复位恢复。
-- NPU 综合：独立综合 `npu_top`，检查 DSP 与 BRAM 映射并运行 `check -assert`。
+- NPU：9 项 Python 参考模型测试和 PE/阵列自检查；GEMM 与量化线性层各有 **29 组矩阵分别在 4×4、2×2 配置**下与 Python 整数参考结果比较，量化层另含 7 组定向计算。检查极值、尾块、反压、bias、舍入、饱和、激活、错误输入和复位恢复。
+- NPU 综合：独立综合 `npu_top` 和 `npu_linear_top`，检查 DSP 与 BRAM 映射并运行 `check -assert`。
 
-2026-11-10 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。GPU 映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；默认 4×4 NPU 映射到 **16 个 DSP48E1、8 个 RAMB18E1**。不同综合版本和布局结果可能变化。完整统计见本地 `build/synthesis.log`、`build/npu-synthesis.log` 或 CI 验证产物。
+2026-11-11 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。GPU 映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；默认 4×4 NPU GEMM 映射到 **16 个 DSP48E1、8 个 RAMB18E1**，带量化线性层的顶层映射到 **20 个 DSP48E1、8 个 RAMB18E1**。不同综合版本和布局结果可能变化。完整统计见本地 `build/` 或 CI 验证产物。
 
 **尚未完成：**Vivado 布局布线/时序收敛、实际 FPGA 下载、显示器和串口的硬件验证。当前结果证明功能仿真和 7 系列逻辑综合通过。
 
@@ -163,8 +164,9 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 ```text
 rtl/                  GPU 的 6 个功能模块与 gpu_top
 rtl/npu/              PE、脉动阵列、分银行缓存与 npu_top
+                       npu_linear_top 的逐通道定点后处理
 tests/rtl/            4 个自检查 SystemVerilog 测试台
-tests/npu/            NPU 的 PE、阵列、任务级测试台
+tests/npu/            NPU 的 PE、阵列、任务和量化层测试台
 tests/test_uart_rect.py
 tests/test_npu_model.py
 tools/uart_rect.py    UART 编码与发送 CLI
@@ -175,13 +177,13 @@ docs/npu.md           NPU 接口、存算组织与参考资料
 .github/workflows/    同入口 CI
 ```
 
-后续可加入 GPU 的多矩形/帧缓冲，并在 NPU 上逐步补齐量化线性层与数据搬运，验证 JEPA 编码器或预测器所需的算子。
+后续可加入 GPU 的多矩形/帧缓冲，并在 NPU 上加入层间数据搬运、模型参数导出与更多算子，验证 JEPA 编码器或预测器。
 
 ## English overview
 
-A small synthesizable GPU/NPU learning project for Xilinx 7-series FPGAs. The GPU draws one UART-controlled rectangle at 640×480 with atomic scene updates. The independent NPU computes signed INT8 matrix products using a 4×4 output-stationary systolic array, INT32 accumulators and banked BRAM. Default jobs support M/N up to 16 and K up to 64, with tagged results and backpressure.
+A small synthesizable GPU/NPU learning project for Xilinx 7-series FPGAs. The GPU draws one UART-controlled rectangle at 640×480 with atomic scene updates. The independent NPU computes signed INT8 matrix products using a 4×4 output-stationary systolic array, INT32 accumulators and banked BRAM. Its linear wrapper adds per-channel bias, ties-away fixed-point scaling, optional ReLU and INT8 saturation.
 
-Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, NPU PE/array behavior, 29 GEMMs on both 4×4 and 2×2 configurations, and Xilinx synthesis of both cores. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
+Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, PE/array behavior, 29 GEMM jobs and 29 quantized linear jobs on each of 4×4 and 2×2 configurations, and Xilinx synthesis of all three tops. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
 
 ## 许可证
 

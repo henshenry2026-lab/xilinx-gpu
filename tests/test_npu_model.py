@@ -43,6 +43,38 @@ class NpuModelTests(unittest.TestCase):
         for a, b in cases:
             self.assertEqual(len(model.matmul_int8(a, b)), len(a))
 
+    def test_linear_rounds_ties_away_from_zero(self):
+        self.assertEqual(model.linear_int8([[ -5, -3, -1, 1, 3, 5]], [0] * 6,
+                                           [1] * 6, [1] * 6),
+                         [[-3, -2, -1, 1, 2, 3]])
+
+    def test_linear_bias_saturation_and_relu(self):
+        accumulators = [[-100, -1, 10, 127, 0]]
+        bias = [0, -200, 200, 0, -(1 << 31)]
+        multipliers = [1] * 5
+        shifts = [0] * 5
+        self.assertEqual(model.linear_int8(accumulators, bias, multipliers, shifts),
+                         [[-100, -128, 127, 127, -128]])
+        self.assertEqual(model.linear_int8(accumulators, bias, multipliers, shifts, relu=True),
+                         [[0, 0, 127, 127, 0]])
+
+    def test_linear_large_multiplier_and_maximum_shift(self):
+        self.assertEqual(model.linear_int8([[-1, 1]], [0, 0],
+                                           [(1 << 31) - 1] * 2, [31, 31]), [[-1, 1]])
+
+    def test_linear_validation(self):
+        invalid = [
+            ([[1]], [], [1], [0]),
+            ([[1]], [0], [0], [0]),
+            ([[1]], [0], [1 << 31], [0]),
+            ([[1]], [0], [1], [32]),
+            ([[1 << 31]], [0], [1], [0]),
+            ([[1.5]], [0], [1], [0]),
+        ]
+        for args in invalid:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                model.linear_int8(*args)
+
 
 if __name__ == "__main__":
     unittest.main()

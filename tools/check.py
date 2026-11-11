@@ -12,7 +12,7 @@ import sys
 import zlib
 
 from uart_rect import encode_rect
-from npu_model import write_vectors
+from npu_model import write_vectors, write_linear_vectors
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -123,11 +123,14 @@ def main():
         preview(args.update_preview)
 
         matrix_cases = write_vectors(BUILD / "npu_cases.txt")
+        linear_cases = write_linear_vectors(BUILD / "npu_linear_cases.txt")
         npu_sources = [path.relative_to(ROOT).as_posix() for path in sorted((ROOT / "rtl/npu").glob("*"))
                        if path.suffix in {".v", ".sv"}]
         npu_benches = [("tb_npu_pe", "pe", []), ("tb_npu_array", "array", []),
                        ("tb_npu_top", "top_4x4", []),
-                       ("tb_npu_top", "top_2x2", ["-Ptb_npu_top.LANES=2"])]
+                       ("tb_npu_top", "top_2x2", ["-Ptb_npu_top.LANES=2"]),
+                       ("tb_npu_linear", "linear_4x4", []),
+                       ("tb_npu_linear", "linear_2x2", ["-Ptb_npu_linear.LANES=2"])]
         for bench, variant, parameters in npu_benches:
             binary = f"build/npu_{variant}.vvp"
             run(f"Compile NPU {variant}", [iverilog, "-g2012", "-Wall", "-s", bench, *parameters,
@@ -140,36 +143,57 @@ def main():
             "npu-synthesis.log", timeout=300)
         modules = json.loads((BUILD / "npu_top.json").read_text(encoding="utf-8"))["modules"]
 
-        def count_cells(module_name):
+        def count_cells(module_name, module_set):
             result = Counter()
-            for cell in modules[module_name].get("cells", {}).values():
+            for cell in module_set[module_name].get("cells", {}).values():
                 kind = cell["type"]
-                child = modules.get(kind, {})
+                child = module_set.get(kind, {})
                 attributes = child.get("attributes", {})
                 # Xilinx primitives may contain timing/specify cells in JSON.
                 # Count the primitive itself, not its simulation internals.
                 primitive = any(int(str(attributes.get(flag, "0")), 2)
                                 for flag in ("blackbox", "whitebox"))
                 if not primitive and child.get("cells"):
-                    result.update(count_cells(kind))
+                    result.update(count_cells(kind, module_set))
                 else:
                     result[kind] += 1
             return result
 
-        resources = count_cells("npu_top")
+        resources = count_cells("npu_top", modules)
         dsp = resources["DSP48E1"]
         bram18 = resources["RAMB18E1"]
         bram36 = resources["RAMB36E1"]
         if not (0 < dsp <= 16) or bram18 + bram36 == 0:
             raise RuntimeError(f"NPU mapping expected DSP MACs and block RAM, got {dict(resources)}")
         print(f"PASS NPU mapping: {dsp} DSP48E1, {bram18} RAMB18E1, {bram36} RAMB36E1", flush=True)
+
+        linear_synthesis = ("read_verilog -sv " + " ".join(npu_sources)
+                            + "; hierarchy -check -top npu_linear_top;"
+                            + " synth_xilinx -family xc7 -top npu_linear_top;"
+                            + " check -assert; stat; write_json build/npu_linear_top.json")
+        run("NPU linear Xilinx 7-series synthesis", [yosys, "-Q", "-T", "-p", linear_synthesis],
+            "npu-linear-synthesis.log", timeout=300)
+        linear_modules = json.loads((BUILD / "npu_linear_top.json").read_text(encoding="utf-8"))["modules"]
+        linear_resources = count_cells("npu_linear_top", linear_modules)
+        linear_dsp = linear_resources["DSP48E1"]
+        linear_bram18 = linear_resources["RAMB18E1"]
+        linear_bram36 = linear_resources["RAMB36E1"]
+        if not (0 < linear_dsp <= 24) or linear_bram18 + linear_bram36 == 0:
+            raise RuntimeError(f"Linear mapping expected DSPs and block RAM, got {dict(linear_resources)}")
+        print(f"PASS NPU linear mapping: {linear_dsp} DSP48E1, {linear_bram18} RAMB18E1, "
+              f"{linear_bram36} RAMB36E1", flush=True)
         summary = {"python_tests": "passed", "rtl_testbenches": benches,
                    "checked_frames": 3, "pixels_per_frame": 307200,
                    "synthesis": "synth_xilinx -family xc7; check -assert",
                    "hardware_validation": "not performed",
                    "npu": {"matrix_cases_per_configuration": matrix_cases, "lanes_tested": [2, 4],
                            "arithmetic": "signed INT8 x INT8 -> INT32",
-                           "dsp48e1": dsp, "ramb18e1": bram18, "ramb36e1": bram36}}
+                           "dsp48e1": dsp, "ramb18e1": bram18, "ramb36e1": bram36},
+                   "npu_linear": {"arithmetic": "INT32 + per-channel bias, fixed-point scale, INT8 clamp",
+                                  "matrix_cases_per_configuration": linear_cases,
+                                  "lanes_tested": [2, 4], "directed_cases_per_configuration": 7,
+                                  "dsp48e1": linear_dsp, "ramb18e1": linear_bram18,
+                                  "ramb36e1": linear_bram36}}
         (BUILD / "check-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print("\nAll checks passed. Results: build/check-summary.json", flush=True)
         return 0
