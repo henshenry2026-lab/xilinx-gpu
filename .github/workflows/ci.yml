@@ -36,4 +36,7 @@ jobs:
             build/*.log
             build/*.png
             build/check-summary.json
+            build/npu-memory-summary.json
+            build/npu-cycle-summary.json
+            build/npu-stream-*-cycles.txt
           retention-days: 14

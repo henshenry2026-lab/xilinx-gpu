@@ -13,6 +13,8 @@ import zlib
 
 from uart_rect import encode_rect
 from npu_model import write_vectors, write_linear_vectors
+from npu_stream import (write_cases as write_stream_cases, estimate_tile_memory,
+                        estimate_gemm_schedule, estimate_mlp_schedule, parameter_sweep)
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -47,6 +49,61 @@ def run(label, command, log_name, timeout=120):
     else:
         print(f"PASS synth_xilinx + check -assert; full report: build/{log_name}", flush=True)
     return output
+
+
+def count_cells(module_name, module_set):
+    result = Counter()
+    for cell in module_set[module_name].get("cells", {}).values():
+        kind = cell["type"]
+        child = module_set.get(kind, {})
+        attributes = child.get("attributes", {})
+        # Count Xilinx primitives, not the timing/specify cells in their models.
+        primitive = any(int(str(attributes.get(flag, "0")), 2)
+                        for flag in ("blackbox", "whitebox"))
+        if not primitive and child.get("cells"):
+            result.update(count_cells(kind, module_set))
+        else:
+            result[kind] += 1
+    return result
+
+
+def resource_summary(top, netlist):
+    resources = count_cells(top, json.loads(netlist.read_text(encoding="utf-8"))["modules"])
+    return {"dsp48e1": resources["DSP48E1"], "ramb18e1": resources["RAMB18E1"],
+            "ramb36e1": resources["RAMB36E1"],
+            "logic_lut_primitives": sum(v for k, v in resources.items() if k.startswith("LUT")),
+            "flip_flops": sum(v for k, v in resources.items() if k.startswith("FD")),
+            "distributed_ram_primitives": {k: v for k, v in sorted(resources.items())
+                                           if k.startswith("RAM") and not k.startswith("RAMB")}}
+
+
+def stream_measurements(path, lanes, k_tile, linear):
+    fields = ["m", "n", "k", "cycles", "load_cycles", "compute_cycles", "input_wait_cycles",
+              "buffer_stall_cycles", "output_stall_cycles", "overlap_cycles", "MAC_count", "mlp_layer"]
+    records = []
+    for line in path.read_text(encoding="ascii").splitlines():
+        values = list(map(int, line.split()))
+        if len(values) != len(fields):
+            raise RuntimeError(f"Malformed measurement: {path.name}")
+        row = dict(zip(fields, values))
+        model = estimate_gemm_schedule(row["m"], row["n"], row["k"], lanes, k_tile,
+                                       output_bytes=1 if linear else 4)
+        if (row["load_cycles"] != model["operand_vector_count"]
+                or row["compute_cycles"] != model["phase_compute_cycles"]
+                or row["MAC_count"] != model["MAC_count"]
+                or row["cycles"] < max(row["compute_cycles"], row["load_cycles"])):
+            raise RuntimeError(f"RTL counters differ from model: {path.name}: {row}")
+        if any(row[key] < 0 or row[key] > row["cycles"] for key in fields[4:10]):
+            raise RuntimeError(f"Invalid cycle counter: {path.name}: {row}")
+        if row["overlap_cycles"] > min(row["load_cycles"], row["compute_cycles"]):
+            raise RuntimeError(f"Invalid overlap counter: {path.name}: {row}")
+        row.update({"predicted": model,
+                    "useful_MACs_per_cycle": row["MAC_count"] / row["cycles"],
+                    "useful_array_utilization": row["MAC_count"] / (row["cycles"]*lanes*lanes)})
+        records.append(row)
+    if not records:
+        raise RuntimeError(f"Empty measurement: {path.name}")
+    return records
 
 
 def preview(update):
@@ -101,7 +158,8 @@ def main():
     args = parser.parse_args()
     BUILD.mkdir(exist_ok=True)
     # Never leave a previous successful summary behind after a failed rerun.
-    (BUILD / "check-summary.json").unlink(missing_ok=True)
+    for name in ["check-summary.json", "npu-memory-summary.json", "npu-cycle-summary.json"]:
+        (BUILD / name).unlink(missing_ok=True)
     try:
         iverilog, vvp, yosys = (find_tool(name) for name in ["iverilog", "vvp", "yosys"])
         run("Python tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
@@ -124,13 +182,25 @@ def main():
 
         matrix_cases = write_vectors(BUILD / "npu_cases.txt")
         linear_cases = write_linear_vectors(BUILD / "npu_linear_cases.txt")
+        stream_cases = write_stream_cases(BUILD / "npu_stream_cases.txt")
         npu_sources = [path.relative_to(ROOT).as_posix() for path in sorted((ROOT / "rtl/npu").glob("*"))
                        if path.suffix in {".v", ".sv"}]
         npu_benches = [("tb_npu_pe", "pe", []), ("tb_npu_array", "array", []),
                        ("tb_npu_top", "top_4x4", []),
                        ("tb_npu_top", "top_2x2", ["-Ptb_npu_top.LANES=2"]),
                        ("tb_npu_linear", "linear_4x4", []),
-                       ("tb_npu_linear", "linear_2x2", ["-Ptb_npu_linear.LANES=2"])]
+                       ("tb_npu_linear", "linear_2x2", ["-Ptb_npu_linear.LANES=2"]),
+                       ("tb_npu_tile_core", "tile_core", []),
+                       ("tb_npu_stream_edges", "stream_edges", []),
+                       ("tb_npu_stream", "stream_raw_4", []),
+                       ("tb_npu_stream", "stream_raw_2", ["-Ptb_npu_stream.LANES=2"]),
+                       ("tb_npu_stream", "stream_linear_4", ["-Ptb_npu_stream.LINEAR=1"]),
+                       ("tb_npu_stream", "stream_linear_2", ["-Ptb_npu_stream.LINEAR=1",
+                                                             "-Ptb_npu_stream.LANES=2"]),
+                       ("tb_npu_stream", "stream_raw_1_k1", ["-Ptb_npu_stream.LANES=1",
+                                                             "-Ptb_npu_stream.K_TILE=1"]),
+                       ("tb_npu_stream", "stream_linear_3_k7", ["-Ptb_npu_stream.LINEAR=1",
+                            "-Ptb_npu_stream.LANES=3", "-Ptb_npu_stream.K_TILE=7"])]
         for bench, variant, parameters in npu_benches:
             binary = f"build/npu_{variant}.vvp"
             run(f"Compile NPU {variant}", [iverilog, "-g2012", "-Wall", "-s", bench, *parameters,
@@ -142,22 +212,6 @@ def main():
         run("NPU Xilinx 7-series synthesis", [yosys, "-Q", "-T", "-p", npu_synthesis],
             "npu-synthesis.log", timeout=300)
         modules = json.loads((BUILD / "npu_top.json").read_text(encoding="utf-8"))["modules"]
-
-        def count_cells(module_name, module_set):
-            result = Counter()
-            for cell in module_set[module_name].get("cells", {}).values():
-                kind = cell["type"]
-                child = module_set.get(kind, {})
-                attributes = child.get("attributes", {})
-                # Xilinx primitives may contain timing/specify cells in JSON.
-                # Count the primitive itself, not its simulation internals.
-                primitive = any(int(str(attributes.get(flag, "0")), 2)
-                                for flag in ("blackbox", "whitebox"))
-                if not primitive and child.get("cells"):
-                    result.update(count_cells(kind, module_set))
-                else:
-                    result[kind] += 1
-            return result
 
         resources = count_cells("npu_top", modules)
         dsp = resources["DSP48E1"]
@@ -182,6 +236,38 @@ def main():
             raise RuntimeError(f"Linear mapping expected DSPs and block RAM, got {dict(linear_resources)}")
         print(f"PASS NPU linear mapping: {linear_dsp} DSP48E1, {linear_bram18} RAMB18E1, "
               f"{linear_bram36} RAMB36E1", flush=True)
+        stream_resources, stream_cycles = {}, {}
+        for lanes in [4, 2]:
+            for linear in [False, True]:
+                top = "npu_stream_linear_top" if linear else "npu_stream_top"
+                name = f"stream_{'linear' if linear else 'raw'}_{lanes}"
+                script = ("read_verilog -sv " + " ".join(npu_sources)
+                          + f"; chparam -set LANES {lanes} -set K_TILE 16 {top};"
+                          + f" hierarchy -check -top {top}; synth_xilinx -family xc7 -top {top};"
+                          + f" check -assert; stat; write_json build/{name}.json")
+                run(f"NPU {name} Xilinx synthesis", [yosys, "-Q", "-T", "-p", script],
+                    f"npu-{name}-synthesis.log", timeout=300)
+                mapped = resource_summary(top, BUILD / f"{name}.json")
+                if (mapped["dsp48e1"] != lanes*lanes+(4 if linear else 0)
+                        or mapped["ramb18e1"] or mapped["ramb36e1"]
+                        or not mapped["distributed_ram_primitives"]):
+                    raise RuntimeError(f"Unexpected bounded-memory/DSP mapping: {name}: {mapped}")
+                stream_resources[name] = {"logical": estimate_tile_memory(lanes), "mapped": mapped}
+                measurement = BUILD / f"npu-stream-{'linear' if linear else 'raw'}-{lanes}-cycles.txt"
+                records = stream_measurements(measurement, lanes, 16, linear)
+                if len(records) != stream_cases or not any(x["overlap_cycles"] for x in records):
+                    raise RuntimeError(f"Missing stream cases/overlap: {name}")
+                stream_cycles[name] = records
+                print(f"PASS {name}: {mapped}", flush=True)
+        memory_summary = {"configurations": stream_resources, "parameter_sweep": parameter_sweep(),
+                          "implemented_tiles": 1, "sweep_multi_tile_results": "theoretical only",
+                          "mlp_default": estimate_mlp_schedule()}
+        cycle_summary = {"measurements": stream_cycles,
+                         "stimulus": "deterministic operand gaps, parameter gaps and output backpressure",
+                         "counters": "non-additive; overlap is load handshake AND compute phase",
+                         "clock_frequency": "not measured; no throughput-in-seconds claim"}
+        (BUILD / "npu-memory-summary.json").write_text(json.dumps(memory_summary, indent=2)+"\n", encoding="utf-8")
+        (BUILD / "npu-cycle-summary.json").write_text(json.dumps(cycle_summary, indent=2)+"\n", encoding="utf-8")
         summary = {"python_tests": "passed", "rtl_testbenches": benches,
                    "checked_frames": 3, "pixels_per_frame": 307200,
                    "synthesis": "synth_xilinx -family xc7; check -assert",
@@ -193,7 +279,14 @@ def main():
                                   "matrix_cases_per_configuration": linear_cases,
                                   "lanes_tested": [2, 4], "directed_cases_per_configuration": 7,
                                   "dsp48e1": linear_dsp, "ramb18e1": linear_bram18,
-                                  "ramb36e1": linear_bram36}}
+                                  "ramb36e1": linear_bram36},
+                   "npu_stream": {"matrix_cases_per_configuration": stream_cases,
+                                  "simulation_configurations": [[4,16,0],[2,16,0],[4,16,1],
+                                                               [2,16,1],[1,1,0],[3,7,1]],
+                                  "full_dimension_edge_tests": ["K=65535", "M=65535", "N=65535"],
+                                  "live_mlp": "16->32->16; RTL output feeds second layer; host scheduled",
+                                  "memory": "npu-memory-summary.json", "cycles": "npu-cycle-summary.json",
+                                  "resources": stream_resources}}
         (BUILD / "check-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print("\nAll checks passed. Results: build/check-summary.json", flush=True)
         return 0

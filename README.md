@@ -5,7 +5,7 @@
 
 一个从小型 2D 图形核开始、逐步加入端侧模型计算的 FPGA 项目：**GPU 通过 UART 控制矩形；NPU 用 INT8 脉动阵列执行矩阵乘法**。
 
-核心使用可综合 Verilog / SystemVerilog，面向 Xilinx 7 系列。GPU 支持一个实心矩形、黑色背景、RGB332、640×480 视频输出；新增 NPU 提供 **4×4 INT8 乘加阵列、INT32 输出、分银行 BRAM 和多块矩阵调度**。项目包含可重复运行的 Python 测试、RTL 仿真和综合检查。
+核心使用可综合 Verilog / SystemVerilog，面向 Xilinx 7 系列。GPU 支持一个实心矩形、黑色背景、RGB332、640×480 视频输出；NPU 提供 **INT8 脉动阵列、INT32 累加和量化线性层**。新增低存储流式路径在默认 4×4、K_TILE=16 时，仅保留 **320 字节 A/B/C 逻辑数据**，支持跨 K 块累加与装载/计算重叠。项目包含可重复运行的 Python 测试、RTL 仿真和综合检查。
 
 ![真实 RTL 仿真生成的 640×480 画面](docs/demo.png)
 
@@ -41,7 +41,7 @@ python tools/check.py
 
 脚本会自动查找 PATH，以及常见的 `C:\msys64\ucrt64\bin` 和 `C:\msys64\mingw64\bin`；其他安装位置请把工具目录加入 PATH。检查失败会返回非零退出码，并保留完整日志。
 
-生成内容位于被 Git 忽略的 `build/`：仿真日志、综合报告、综合后 JSON 网表、`demo.ppm`、`demo.png` 和 `check-summary.json`。有意修改演示场景后，使用 `python tools/check.py --update-preview` 刷新 README 图片。
+生成内容位于被 Git 忽略的 `build/`：仿真日志、综合报告、综合后 JSON 网表、`demo.ppm`、`demo.png`、`check-summary.json`，以及新路径的 `npu-memory-summary.json`、`npu-cycle-summary.json` 和逐任务周期记录。CI 上传相同摘要和日志。有意修改演示场景后，使用 `python tools/check.py --update-preview` 刷新 README 图片。
 
 ## NPU 矩阵计算
 
@@ -54,6 +54,33 @@ python tools/check.py        # GPU + NPU 的统一检查入口
 ```
 
 设计借鉴 hls4ml / FINN 的量化与并行复用、Google TPU 的脉动阵列，以及 Snowflake / Angel-Eye 的存算组织。详见 [NPU 架构、接口、验证和参考资料](docs/npu.md)。这是面向未来端侧小模型和 JEPA 研究的矩阵内核；板级传输和完整模型执行留待后续实现。
+
+## 低存储 Streaming Micro-NPU
+
+`npu_stream_top` 和 `npu_stream_linear_top` 是独立的新接口，复用同一脉动阵列；原有 BRAM 顶层继续保留。新路径按块接收配对的 A/B 向量，两个缓存银行交替装载和消费，INT32 部分和留在 PE 中直到完整 K 维计算结束。矩阵尺寸为 16 位非零数，缓存容量随 `LANES`、`K_TILE` 改变，与完整矩阵尺寸无关。
+
+```mermaid
+flowchart LR
+    HOST[主机 / 上游数据生成器] -->|A/B 配对向量| BUF[双银行 LUTRAM\n每银行 K_TILE 个向量]
+    BUF --> TILE[npu_tile_core\n脉动阵列 + 保留部分和]
+    TILE --> RAW[带坐标 INT32 输出]
+    RAW --> Q[可选流式量化\nbias / scale / ReLU / clamp]
+    HOST -->|每结果一组参数| Q
+    Q --> OUT[带坐标 INT8 输出]
+```
+
+默认 A 双缓冲 128 B、B 双缓冲 128 B、C 累加 64 B，共 **320 B**。这只是数据负载，不是全部硬件状态：还包括传播/错拍寄存器、控制、64 位统计计数器和量化输出寄存器。小缓存采用打包的分布式 RAM，避免多个小银行各占一个 BRAM；实际分配以综合报告为准。
+
+主机按“块行、块列、k”重放操作数；量化参数按结果的块内输出顺序逐项提供，不保存整层参数表。输入传输和参数重放都计入 Python 流量模型。用小缓存换取数据重读的成本是显式的，并没有假设外部存储具有无限带宽。
+
+```sh
+python tools/npu_stream.py                 # 默认内存与 16→32→16 MLP 调度预算
+python tools/npu_stream.py --lanes 2       # 比较小阵列
+python tools/npu_stream.py --sweep         # LANES / K_TILE / 理论 Tile 数参数扫描
+python tools/check.py                     # 整体功能、计数器对照与综合
+```
+
+仿真中的两层 MLP 由测试台调度，第二层使用第一层的实际 RTL 输出。当前只实现一个 Tile；扫描中的多 Tile 数据仅是理论估算。batch=1 的矩阵形状会闲置阵列行，因此报告有效 MAC/周期和利用率，不把 PE 峰值当作应用性能。新接口、流量公式、计数器含义见 [NPU 文档](docs/npu.md#低存储流式接口)。
 
 ## GPU 模块与“存、算”
 
@@ -154,8 +181,21 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 - 综合：`synth_xilinx -family xc7`，随后执行 `check -assert`。
 - NPU：9 项 Python 参考模型测试和 PE/阵列自检查；GEMM 与量化线性层各有 **29 组矩阵分别在 4×4、2×2 配置**下与 Python 整数参考结果比较，量化层另含 7 组定向计算。检查极值、尾块、反压、bias、舍入、饱和、激活、错误输入和复位恢复。
 - NPU 综合：独立综合 `npu_top` 和 `npu_linear_top`，检查 DSP 与 BRAM 映射并运行 `check -assert`。
+- 流式 NPU：每配置 31 组矩阵（包含确定性舍入/饱和和两层 MLP），原始/量化路径均测试 4×4、2×2；另测 1×1/K_TILE=1 与 3×3/K_TILE=7。覆盖跨 K 块、输入间断、输出反压、非法参数重试、复位、完整 K/M/N=65535 边界和周期/流量模型对照。
+- 流式综合：分别检查原始/量化、4×4/2×2 四种配置，要求 DSP、分布式 RAM 和零 BRAM 映射；运行 `check -assert`。
 
 2026-11-11 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。GPU 映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；默认 4×4 NPU GEMM 映射到 **16 个 DSP48E1、8 个 RAMB18E1**，带量化线性层的顶层映射到 **20 个 DSP48E1、8 个 RAMB18E1**。不同综合版本和布局结果可能变化。完整统计见本地 `build/` 或 CI 验证产物。
+
+2026-11-12 使用相同本地工具检查新流式路径（K_TILE=16）：
+
+| 顶层 | LANES | A/B/C 逻辑字节 | DSP48E1 | RAMB18/36 | RAM32M | 逻辑 LUT 原语 | 触发器 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `npu_stream_top` | 4 | 320 | 16 | 0 | 12 | 1673 | 1284 |
+| `npu_stream_linear_top` | 4 | 320 | 20 | 0 | 12 | 2573 | 1459 |
+| `npu_stream_top` | 2 | 144 | 4 | 0 | 6 | 1294 | 978 |
+| `npu_stream_linear_top` | 2 | 144 | 8 | 0 | 6 | 2144 | 1153 |
+
+LUT 列不含 LUTRAM 占用；RAM32M 是原语数量，不能当作字节数。触发器包含控制和统计；量化层另有组合缩放逻辑。以上是独立顶层的逻辑综合结果，不包含 GPU，也没有测得工作频率、功耗或物理时延。
 
 **尚未完成：**Vivado 布局布线/时序收敛、实际 FPGA 下载、显示器和串口的硬件验证。当前结果证明功能仿真和 7 系列逻辑综合通过。
 
@@ -165,25 +205,29 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 rtl/                  GPU 的 6 个功能模块与 gpu_top
 rtl/npu/              PE、脉动阵列、分银行缓存与 npu_top
                        npu_linear_top 的逐通道定点后处理
+                       npu_stream_buffer / tile_core / stream_top / stream_linear_top
 tests/rtl/            4 个自检查 SystemVerilog 测试台
 tests/npu/            NPU 的 PE、阵列、任务和量化层测试台
 tests/test_uart_rect.py
 tests/test_npu_model.py
 tools/uart_rect.py    UART 编码与发送 CLI
 tools/npu_model.py    整数参考模型、写地址打包与测试向量
+tools/npu_stream.py   低存储分块、向量重放、流量和周期预算、MLP 向量
 tools/check.py        GPU + NPU 跨平台验证与预览生成
 docs/demo.png         从真实 RTL 输出生成的演示图
 docs/npu.md           NPU 接口、存算组织与参考资料
 .github/workflows/    同入口 CI
 ```
 
-后续可加入 GPU 的多矩形/帧缓冲，并在 NPU 上加入层间数据搬运、模型参数导出与更多算子，验证 JEPA 编码器或预测器。
+后续可加入 GPU 的多矩形/帧缓冲；NPU 可从实测 batch=1 利用率和输入流量出发，优化矩阵向量数据流，再接真实存储接口、模型参数导出和其他算子，逐步验证 JEPA 编码器或预测器。
 
 ## English overview
 
 A small synthesizable GPU/NPU learning project for Xilinx 7-series FPGAs. The GPU draws one UART-controlled rectangle at 640×480 with atomic scene updates. The independent NPU computes signed INT8 matrix products using a 4×4 output-stationary systolic array, INT32 accumulators and banked BRAM. Its linear wrapper adds per-channel bias, ties-away fixed-point scaling, optional ReLU and INT8 saturation.
 
-Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, PE/array behavior, 29 GEMM jobs and 29 quantized linear jobs on each of 4×4 and 2×2 configurations, and Xilinx synthesis of all three tops. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
+The new streaming tops retain only a bounded tile working set: 320 bytes of logical A/B/C payload at LANES=4, K_TILE=16, with ping-pong LUTRAM, K-chunk accumulation and streamed quantization parameters. Control, pipelines and counters are reported separately. Tests chain a 16→32→16 INT8 MLP using actual RTL intermediate outputs; layer scheduling is host-side. One Tile is implemented; multi-Tile sweep figures are theoretical.
+
+Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, legacy GEMM/linear regressions, 31 streaming jobs per configuration, full 16-bit dimension edges, RTL/model cycle counters, and seven Xilinx top-level syntheses. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
 
 ## 许可证
 
