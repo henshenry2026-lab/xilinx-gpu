@@ -82,6 +82,33 @@ python tools/check.py                     # 整体功能、计数器对照与综
 
 仿真中的两层 MLP 由测试台调度，第二层使用第一层的实际 RTL 输出。当前只实现一个 Tile；扫描中的多 Tile 数据仅是理论估算。batch=1 的矩阵形状会闲置阵列行，因此报告有效 MAC/周期和利用率，不把 PE 峰值当作应用性能。新接口、流量公式、计数器含义见 [NPU 文档](docs/npu.md#低存储流式接口)。
 
+## 量化模型到流式 NPU 的映射器 v0
+
+`tools/npu_mapper.py` 将**串接的线性层 JSON**转换成现有 RTL 可消费的配对 A/B 向量和逐结果参数流：逐通道 INT8 权重、INT32 bias、正整数乘数/右移、可选 ReLU。激活 input/output scale 显式指定，权重 scale 可逐通道指定或按最大绝对值自动计算；所有零点固定为0。工具只依赖 Python 标准库，`--simulate` 才需要 Icarus Verilog。
+
+```sh
+python tools/npu_mapper.py --model examples/npu/tiny_mlp.json --inputs examples/npu/tiny_mlp_inputs.json --output-dir build/mapped --simulate
+python tools/npu_mapper.py --model examples/npu/tiny_mlp.json --inputs examples/npu/tiny_mlp_inputs.json --output-dir build/mapped-l2 --lanes 2 --simulate
+python tools/check.py
+```
+
+示例为固定随机种子的未训练 `16→32→16` MLP，附3条输入。权重布局为 **weights[K][N]**，输入为 `[batch][K]`。导出目录包含 `mapped-model.json`、任务描述符、首次量化输入、操作数/参数流、参考结果和 `report.json`。仿真直接读取这些流文件，使用捕获的 RTL 中间激活驱动下一层，并检查整数结果、坐标、last、反压和周期计数。
+
+报告区分 **Python binary64 浮点参考与反量化整数结果的误差**、**RTL 与整数参考是否逐项一致**。它记录 MAE/RMSE/最大绝对误差、真正截断的元素数、仅命中 INT8 上下界的元素数、逐通道缩放近似误差、输入/权重重放、参数流量和逻辑激活存储预算。`rtl_validation.status` 只有在实际仿真和结果核对后才为 `passed`；不带 `--simulate` 时为 `not_run`。
+
+2026-11-14 本地示例结果（K_TILE=16；周期为两层 busy 周期之和，含测试输入间断和输出反压，排除主机层间调度/传输）：
+
+| Batch | LANES | 有效 MAC | A/B 流量 B | 参数紧密打包 B | 逻辑主机激活峰值 B | 仿真 busy 周期 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 1024 | 2048 | 420 | 48 | 837 |
+| 1 | 4 | 1024 | 2048 | 420 | 48 | 552 |
+| 3 | 2 | 3072 | 4096 | 1260 | 144 | 1679 |
+| 3 | 4 | 3072 | 2048 | 1260 | 144 | 709 |
+
+batch=3 的最终输出 RMSE 约 **0.01715**、最大绝对误差约 **0.04554**，两层均无输出截断；这是该确定性示例的数值误差，不是模型任务精度。LANES=2/4 的整数结果相同。激活峰值仅指理论双区 INT8 负载，Python 验证工具还保留源模型、参考矩阵和各层跟踪，不能据此推断进程实际内存。
+
+统一检查另测 `5→7→3` 尾块、batch=1/3、LANES=2/4 和 K_TILE=3；汇总见 `build/npu-mapper-summary.json`，逐配置证据见 `build/mapper/`，CI 同步上传。完整格式、算式和文件顺序见 [映射器接口说明](docs/npu.md#模型映射器-v0)。目前没有 ONNX/Keras/PyTorch 导入、自动激活标定、训练或真实 FPGA 模型执行。
+
 ## GPU 模块与“存、算”
 
 ```mermaid
@@ -183,6 +210,7 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 - NPU 综合：独立综合 `npu_top` 和 `npu_linear_top`，检查 DSP 与 BRAM 映射并运行 `check -assert`。
 - 流式 NPU：每配置 31 组矩阵（包含确定性舍入/饱和和两层 MLP），原始/量化路径均测试 4×4、2×2；另测 1×1/K_TILE=1 与 3×3/K_TILE=7。覆盖跨 K 块、输入间断、输出反压、非法参数重试、复位、完整 K/M/N=65535 边界和周期/流量模型对照。
 - 流式综合：分别检查原始/量化、4×4/2×2 四种配置，要求 DSP、分布式 RAM 和零 BRAM 映射；运行 `check -assert`。
+- 模型映射器：数值/格式/流布局测试、半整数邻近值和尺度溢出回归；6组模型配置直接消费导出流并串接实际 RTL 激活，逐项比较整数结果，核查周期，并检查损坏流会失败且不会保留通过状态。
 
 2026-11-11 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。GPU 映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；默认 4×4 NPU GEMM 映射到 **16 个 DSP48E1、8 个 RAMB18E1**，带量化线性层的顶层映射到 **20 个 DSP48E1、8 个 RAMB18E1**。不同综合版本和布局结果可能变化。完整统计见本地 `build/` 或 CI 验证产物。
 
@@ -213,19 +241,25 @@ tests/test_npu_model.py
 tools/uart_rect.py    UART 编码与发送 CLI
 tools/npu_model.py    整数参考模型、写地址打包与测试向量
 tools/npu_stream.py   低存储分块、向量重放、流量和周期预算、MLP 向量
+tools/npu_mapper.py   线性层 JSON 量化、流导出、误差与存储/流量报告
+tools/npu_mapper_sim.py  导出流的 RTL 仿真与结果/计数器核对
+tools/hdl_tools.py    共享 Icarus / Yosys 查找
+examples/npu/         未训练 16→32→16 示例模型与3条输入
 tools/check.py        GPU + NPU 跨平台验证与预览生成
 docs/demo.png         从真实 RTL 输出生成的演示图
 docs/npu.md           NPU 接口、存算组织与参考资料
 .github/workflows/    同入口 CI
 ```
 
-后续可加入 GPU 的多矩形/帧缓冲；NPU 可从实测 batch=1 利用率和输入流量出发，优化矩阵向量数据流，再接真实存储接口、模型参数导出和其他算子，逐步验证 JEPA 编码器或预测器。
+后续可加入 GPU 的多矩形/帧缓冲；NPU 可从实测 batch=1 利用率和输入流量出发，优化矩阵向量数据流，再接真实存储接口、框架参数导入和其他算子，逐步验证 JEPA 编码器或预测器。
 
 ## English overview
 
 A small synthesizable GPU/NPU learning project for Xilinx 7-series FPGAs. The GPU draws one UART-controlled rectangle at 640×480 with atomic scene updates. The independent NPU computes signed INT8 matrix products using a 4×4 output-stationary systolic array, INT32 accumulators and banked BRAM. Its linear wrapper adds per-channel bias, ties-away fixed-point scaling, optional ReLU and INT8 saturation.
 
 The new streaming tops retain only a bounded tile working set: 320 bytes of logical A/B/C payload at LANES=4, K_TILE=16, with ping-pong LUTRAM, K-chunk accumulation and streamed quantization parameters. Control, pipelines and counters are reported separately. Tests chain a 16→32→16 INT8 MLP using actual RTL intermediate outputs; layer scheduling is host-side. One Tile is implemented; multi-Tile sweep figures are theoretical.
+
+The v0 Python mapper accepts sequential floating-point linear layers as JSON, applies zero-point-zero per-channel weight quantization and explicit activation scales, and exports the actual operand/parameter streams. `--simulate` feeds those streams into the unchanged RTL and chains captured intermediate activations. Reports separate binary64-reference quantization error from exact integer RTL agreement, and logical activation payload from actual host memory. Examples are deterministic and untrained; framework import, automatic calibration and trained-model execution are future work.
 
 Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, legacy GEMM/linear regressions, 31 streaming jobs per configuration, full 16-bit dimension edges, RTL/model cycle counters, and seven Xilinx top-level syntheses. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
 

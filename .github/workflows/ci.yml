@@ -39,4 +39,8 @@ jobs:
             build/npu-memory-summary.json
             build/npu-cycle-summary.json
             build/npu-stream-*-cycles.txt
+            build/npu-mapper-summary.json
+            build/mapper/**/*.json
+            build/mapper/**/*.log
+            build/mapper/**/*.txt
           retention-days: 14

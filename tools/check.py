@@ -3,9 +3,7 @@
 import argparse
 from collections import Counter
 import json
-import os
 from pathlib import Path
-import shutil
 import struct
 import subprocess
 import sys
@@ -15,24 +13,12 @@ from uart_rect import encode_rect
 from npu_model import write_vectors, write_linear_vectors
 from npu_stream import (write_cases as write_stream_cases, estimate_tile_memory,
                         estimate_gemm_schedule, estimate_mlp_schedule, parameter_sweep)
+from hdl_tools import find_tool
+from npu_mapper import export_bundle
+from npu_mapper_sim import simulate_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-
-
-def find_tool(name):
-    found = shutil.which(name)
-    if not found and os.name == "nt":
-        for folder in [Path("C:/msys64/ucrt64/bin"), Path("C:/msys64/mingw64/bin")]:
-            candidate = folder / f"{name}.exe"
-            if candidate.is_file():
-                found = str(candidate)
-                break
-    if not found:
-        raise RuntimeError(f"Missing {name}. Install Icarus Verilog and Yosys; see README.md.")
-    # Windows tools also need their companion DLLs and ABC on PATH.
-    os.environ["PATH"] = str(Path(found).parent) + os.pathsep + os.environ.get("PATH", "")
-    return found
 
 
 def run(label, command, log_name, timeout=120):
@@ -158,7 +144,8 @@ def main():
     args = parser.parse_args()
     BUILD.mkdir(exist_ok=True)
     # Never leave a previous successful summary behind after a failed rerun.
-    for name in ["check-summary.json", "npu-memory-summary.json", "npu-cycle-summary.json"]:
+    for name in ["check-summary.json", "npu-memory-summary.json", "npu-cycle-summary.json",
+                 "npu-mapper-summary.json"]:
         (BUILD / name).unlink(missing_ok=True)
     try:
         iverilog, vvp, yosys = (find_tool(name) for name in ["iverilog", "vvp", "yosys"])
@@ -206,6 +193,37 @@ def main():
             run(f"Compile NPU {variant}", [iverilog, "-g2012", "-Wall", "-s", bench, *parameters,
                 "-o", binary, *npu_sources, f"tests/npu/{bench}.sv"], f"npu_{variant}-compile.log")
             run(f"NPU {variant}", [vvp, binary], f"npu_{variant}.log")
+        model = json.loads((ROOT/"examples/npu/tiny_mlp.json").read_text(encoding="utf-8"))
+        samples = json.loads((ROOT/"examples/npu/tiny_mlp_inputs.json").read_text(encoding="utf-8"))
+        # Independent tail shapes exercise exporter padding and parameter replay.
+        tail_model = {"format": "xilinx-gpu.linear.v1", "input_scale": 0.125, "layers": [
+            {"name": f"tail_{i}", "weights": [[0.125*((r*3+c*2)%9-4) for c in range(n)] for r in range(k)],
+             "bias": [0.015625*(c-2) for c in range(n)], "output_scale": 0.0625, "relu": i == 0}
+            for i, (k, n) in enumerate([(5, 7), (7, 3)])]}
+        tail_samples = [[0.125*((r*7+c*3)%13-6) for c in range(5)] for r in range(3)]
+        mapper_reports = {}
+        for name, source, inputs, chunk in [("mlp_batch1", model, samples[:1], 16),
+                                             ("mlp_batch3", model, samples, 16),
+                                             ("tail_batch3", tail_model, tail_samples, 3)]:
+            for lanes in [2, 4]:
+                variant = f"{name}_l{lanes}"
+                folder = BUILD/"mapper"/variant
+                export_bundle(source, inputs, folder, lanes, chunk)
+                measured = simulate_bundle(folder)
+                mapper_reports[variant] = {"report": folder.relative_to(BUILD).as_posix()+"/report.json",
+                    "lanes": lanes, "k_tile": chunk, "batch": len(inputs), "MAC_count": measured["MAC_count"],
+                    "host_activation_peak_bytes": measured["host_activation_peak_bytes"],
+                    "operand_stream_bytes": measured["operand_stream_bytes"],
+                    "parameter_packed_bytes": measured["parameter_packed_bytes"],
+                    "sum_layer_busy_cycles": sum(x["rtl"]["cycles"] for x in measured["layers"]),
+                    "layers": [{key: layer[key] for key in ("name", "shape", "error", "saturated_elements", "rtl")}
+                               for layer in measured["layers"]]}
+                print(f"PASS mapped {variant}: {measured['MAC_count']} MACs, all RTL outputs match integer reference", flush=True)
+        mapper_summary = {"configurations": mapper_reports, "integer_mismatches": 0,
+                          "float_reference": "Python binary64; untrained deterministic examples",
+                          "hardware_validation": "not performed",
+                          "cycles_note": "sum of layer busy cycles; excludes host inter-layer scheduling/transport"}
+        (BUILD/"npu-mapper-summary.json").write_text(json.dumps(mapper_summary, indent=2)+"\n", encoding="utf-8")
         npu_synthesis = ("read_verilog -sv " + " ".join(npu_sources)
                          + "; hierarchy -check -top npu_top; synth_xilinx -family xc7 -top npu_top;"
                          + " check -assert; stat; write_json build/npu_top.json")
@@ -286,7 +304,10 @@ def main():
                                   "full_dimension_edge_tests": ["K=65535", "M=65535", "N=65535"],
                                   "live_mlp": "16->32->16; RTL output feeds second layer; host scheduled",
                                   "memory": "npu-memory-summary.json", "cycles": "npu-cycle-summary.json",
-                                  "resources": stream_resources}}
+                                  "resources": stream_resources},
+                   "npu_mapper": {"summary": "npu-mapper-summary.json",
+                                  "rtl_configurations": list(mapper_reports), "integer_mismatches": 0,
+                                  "float_reference": "Python binary64", "training": "not performed"}}
         (BUILD / "check-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print("\nAll checks passed. Results: build/check-summary.json", flush=True)
         return 0

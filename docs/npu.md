@@ -193,6 +193,83 @@ NPU 自检查覆盖：
 
 batch=1会使矩阵阵列的多行闲置，输出串行化和逐结果参数也有成本。本版先提供可测量基线；后续可据实际流量与利用率选择矩阵向量专用调度或多个向量打包。没有外部存储控制器、多Tile Cluster、卷积专用数据流、INT4/稀疏计算、LayerNorm或训练好的JEPA执行，也没有Vivado时序或上板性能结论。
 
+## 模型映射器 v0
+
+`tools/npu_mapper.py` 是现有单 Tile 流式接口的主机端转换器，接受连续线性层与显式激活 scale，导出操作数、参数和可重复验证的结果。它没有修改 PE/阵列/流式顶层，也没有增加多核或板级传输。
+
+### 源格式与数值契约
+
+源模型为以下 JSON（示例2输入、2输出，`weights[K][N]`，可选 ReLU）：
+
+```json
+{
+  "format": "xilinx-gpu.linear.v1",
+  "input_scale": 0.125,
+  "layers": [{
+    "name": "projection",
+    "weights": [[0.5, -0.25], [0.25, 0.5]],
+    "bias": [0.0, 0.125],
+    "weight_scales": [0.003937007874015748, 0.003937007874015748],
+    "output_scale": 0.125,
+    "relu": false
+  }]
+}
+```
+
+`--inputs` 指向另一个 JSON 矩阵 `[batch][K]`，其中数值是浮点域输入，不是已经量化的字节。每层必需 `name/weights/bias/output_scale`，name非空且唯一，bias长度与N一致；relu默认false。`weight_scales` 可以省略（或null），此时每列取 `max(abs(weight))/127`，全零列取1。所有输入数值须有限，scale须正且有限，层间维度必须匹配。拒绝未知字段和其他激活；没有隐式转置、非零zero-point、稀疏或INT4模式。
+
+设 `sx` 为当前激活scale，`sw[c]` 为权重列scale，`sy` 为输出scale，R为就近、半整数远离0舍入：
+
+```text
+qx = clamp_int8(R(x / sx))
+qw[k,c] = clamp_int8(R(w[k,c] / sw[c]))
+qb[c] = R(bias[c] / (sx * sw[c]))
+ratio[c] = sx * sw[c] / sy
+ratio[c] ≈ multiplier[c] / 2**shift[c]
+g = qx × qw
+qy = existing_RTL_requantize(g + qb, multiplier, shift, relu)
+y_dequantized = qy * sy
+```
+
+输入/权重允许有计数的INT8截断。qb须在INT32范围，scale乘积须为正有限数。乘数限制1…2^31−1、shift限制0…31；工具从最高shift向下选择可表达的最接近整数乘数，无法表达时报错。目标ratio、实际ratio和相对误差记在 `mapped-model.json` 的 `requantization` 中。偏置不截断、累加不回绕；INT32+INT32与乘法沿用RTL扩展位宽及ties-away规则。
+
+源浮点参考使用Python binary64逐层执行原始权重、bias和ReLU，量化参考则使用整数上一层输出；因此误差包含输入量化、权重/bias量化、乘数近似、舍入、激活和截断的累积影响。这里不模拟框架FP32舍入、不做自动标定或量化感知训练。未知scale需要用户用自己的代表性数据确定。
+
+### 命令与导出文件
+
+```sh
+python tools/npu_mapper.py --model examples/npu/tiny_mlp.json --inputs examples/npu/tiny_mlp_inputs.json --output-dir build/mapped
+python tools/npu_mapper.py --model examples/npu/tiny_mlp.json --inputs examples/npu/tiny_mlp_inputs.json --output-dir build/mapped --simulate
+python tools/check.py
+```
+
+不带 `--simulate` 只需Python标准库；带该选项查找Icarus，运行 `tests/npu/tb_npu_mapped.sv`。该仿真适配器支持batch≤8、每层输入/输出特征≤256、层数≤64；源格式与RTL尺寸仍可到16位，超出仿真适配器限制的模型可以仅导出。输入反压和结果反压都是测试激励，不对应任何已实现的外部接口带宽。
+
+| 文件 | 格式与用途 |
+|---|---|
+| `mapped-model.json` | `xilinx-gpu.mapped-linear.v1`；量化权重、bias、乘数/shift、scale诊断。当前CLI读取源格式，不能将此诊断文件直接当作源模型 |
+| `jobs.txt` | 首行 `层数 LANES K_TILE`，后续每层 `M N K relu`；每层映射为一个完整GEMM任务 |
+| `inputs.txt` | 首层量化输入，按全局行优先排列的十进制INT8 |
+| `operands.txt` | 所有层连续的 `A_hex B_hex` 配对向量，每个向量恰2×LANES个十六进制字符，低位字节lane0；块行、块列、k顺序，尾lane填0 |
+| `parameters.txt` | 每真实结果一行 `row col bias multiplier shift`，采用块行、块列、块内行、块内列顺序。row/col仅为诊断标签，实际RTL参数接口没有这些字段 |
+| `expected.txt` | 每层整数输出，逐层、全局行优先；只供核对，不送入计算接口 |
+| `report.json` | 浮点/整数输出、误差/截断、预算与实际RTL验证状态 |
+| `rtl-results.txt` | 仿真实际输出 `layer_index row col signed_int8`，Python再独立检查重复/遗漏坐标和数值 |
+| `rtl-cycles.txt` | 每层 `layer_index M N K total load compute input_wait buffer_stall output_stall overlap MAC` |
+| `compile.log`、`simulation.log` | 编译/仿真证据；`mapped.vvp`为本地构建输出 |
+
+仿真读取导出的B向量与参数，不根据浮点模型重建它们；先核对导出的A向量与实际激活一致，再把捕获的实际激活送入RTL。第一层从 `inputs.txt` 开始，后续层从上一层实际结果开始。每层检查结果、坐标、last、反压保持、输入窗口和done；任务结束检查流无多余数据。Python随后核查实际输出以及load/compute/MAC计数与独立公式一致，只有全部通过才设置 `rtl_validation.status=passed`。
+
+仅导出时状态为 `not_run`。重跑仿真前清除旧通过状态，失败写为 `failed` 并保留诊断；源模型/输入解析失败会移除该输出目录中的旧 `report.json`，避免把上一次通过当成本次结果。其他旧文件可能仍留在目录，应以新报告状态和命令退出码为准。
+
+### 误差、内存与流量报告
+
+各层 `error` 包含MAE、RMSE、最大绝对误差和相对L2；参考L2为0而误差非0时相对L2为null。`saturated_elements`统计激活后的整数在最终clamp前真正越界，`at_int8_bounds`统计输出恰为−128/127，两者含义不同。输入和权重的截断另行计数。整数RTL逐项匹配不能证明浮点模型任务精度。
+
+`host_activation_peak_bytes=max(batch×(K+N))` 是层间两区INT8激活的逻辑最低预算；验证器实际还保留全部中间跟踪、INT32参考和浮点模型，并未实现受该字节数约束的低内存Python运行时。Tile A/B/C预算、控制与物理资源仍分开报告。`unique_input_bytes`、`unique_weight_bytes` 与A/B实际重放流量分开列出。每通道bias/scale负载70位；报告同时给出紧密打包与逐结果9字节对齐预算。文本文件大小、串行封包、控制开销和源模型的浮点scale元数据不包含在这些传输字节数中。
+
+统一检查使用确定性未训练16→32→16模型的batch=1/3，以及5→7→3的batch=3尾块模型，均验证LANES=2/4。`build/npu-mapper-summary.json`汇总六组配置，`build/mapper/`保留逐组完整证据，CI上传相同产物。`sum_layer_busy_cycles`只相加各层busy周期，不含层间主机处理、文件I/O或真实设备传输；没有据此推算毫秒、功耗或上板吞吐。
+
 ## 设计参考与 JEPA 方向
 
 本版代码独立实现，只借鉴以下设计思路，没有移植这些项目的源码，也没有引用其性能作为本项目指标：
@@ -205,6 +282,6 @@ batch=1会使矩阵阵列的多行闲置，输出串行化和逐结果参数也�
 | [Snowflake](https://doi.org/10.1109/ISCAS.2017.8050809) | 可扩展卷积加速器、数据复用 | 从复用的矩阵运算块起步，后续可接卷积展开或专用数据生成 |
 | [Angel-Eye](https://doi.org/10.1109/TCAD.2017.2705069) | 低精度计算、存储/计算配合、软硬件映射 | 固定整数数据约定、Python 装载布局、可编程任务尺寸 |
 
-[I-JEPA](https://github.com/facebookresearch/ijepa) 在表示空间做预测。后续可以选定小型编码器或预测器的一层线性投影，将量化权重导出为 A/B，用本核心验证整数结果和反量化误差；已有流式K分块之后，再补真实存储通路、参数转换、层间调度、残差和模型需要的其他算子。
+[I-JEPA](https://github.com/facebookresearch/ijepa) 在表示空间做预测。后续可以选定小型编码器或预测器的一层线性投影，将量化权重导出为 A/B，用本核心验证整数结果和反量化误差；已有流式K分块和JSON模型映射之后，再补真实存储通路、框架导入、层间调度、残差和模型需要的其他算子。
 
 当前并未运行训练好的 JEPA 模型。整数计算逐位一致、量化后的表示质量、完整模型时延和真实 FPGA 行为需要分别验证。
