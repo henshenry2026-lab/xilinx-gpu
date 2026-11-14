@@ -1,4 +1,4 @@
-"""Map sequential floating-point linear layers to the existing INT8 NPU stream."""
+"""Map sequential floating-point linear layers to INT8 GEMM or GEMV streams."""
 import argparse
 import json
 import math
@@ -6,6 +6,7 @@ from pathlib import Path
 
 from npu_model import matmul_int8, linear_int8
 from npu_stream import estimate_tile_memory, estimate_gemm_schedule, operand_vectors
+from npu_gemv import estimate_gemv_memory, estimate_gemv_schedule, operand_beats
 
 SOURCE_FORMAT = "xilinx-gpu.linear.v1"
 MAPPED_FORMAT = "xilinx-gpu.mapped-linear.v1"
@@ -160,12 +161,21 @@ def _saturation_count(raw, layer):
     return count
 
 
-def map_model(model, samples, lanes=4, k_tile=16):
+def map_model(model, samples, lanes=4, k_tile=None, backend="gemm"):
+    if backend not in ("gemm", "gemv"):
+        raise ValueError("backend must be gemm or gemv")
+    if backend == "gemv" and k_tile is not None:
+        raise ValueError("k_tile is not supported by GEMV")
+    if backend == "gemm" and k_tile is None:
+        k_tile = 16
     compiled = compile_model(model)
     samples = _matrix(samples, "inputs")
+    if backend == "gemv" and len(samples) != 1:
+        raise ValueError("GEMV requires batch=1")
     if len(samples[0]) != compiled["layers"][0]["input_features"]:
         raise ValueError("input width differs from first layer weights[K][N]")
-    tile_memory = estimate_tile_memory(lanes, k_tile)
+    tile_memory = (estimate_gemv_memory(lanes) if backend == "gemv"
+                   else estimate_tile_memory(lanes, k_tile))
     activations, input_clipped = [], 0
     for row in samples:
         quantized, clipped = quantize_values(row, compiled["input_scale"])
@@ -180,7 +190,8 @@ def map_model(model, samples, lanes=4, k_tile=16):
         if layer["relu"]:
             floating = [[max(0.0, value) for value in row] for row in floating]
         dequantized = [[value*layer["output_scale"] for value in row] for row in output]
-        schedule = estimate_gemm_schedule(m, n, k, lanes, k_tile, output_bytes=1)
+        schedule = (estimate_gemv_schedule(n, k, lanes, output_bytes=1) if backend == "gemv"
+                    else estimate_gemm_schedule(m, n, k, lanes, k_tile, output_bytes=1))
         trace.append({"inputs": activations, "raw": raw, "outputs": output})
         reports.append({"name": layer["name"], "shape": {"m": m, "n": n, "k": k},
             "float_reference": floating, "int8_output": output, "dequantized_output": dequantized,
@@ -189,11 +200,14 @@ def map_model(model, samples, lanes=4, k_tile=16):
             "weight_clipped_elements": layer["weights_clipped"],
             "unique_input_bytes": m*k, "unique_weight_bytes": k*n,
             "unique_bias_scale_packed_bytes": (70*n+7)//8,
-            "host_activation_bytes": m*(k+n), "A_stream_bytes": schedule["operand_vector_count"]*lanes,
+            "host_activation_bytes": m*(k+n),
+            "A_stream_bytes": schedule["operand_vector_count"]*(1 if backend == "gemv" else lanes),
             "B_stream_bytes": schedule["operand_vector_count"]*lanes,
             "parameter_byte_aligned_bytes": m*n*9, "schedule": schedule})
         activations = output
-    report = {"format": "xilinx-gpu.mapper-report.v1", "lanes": lanes, "k_tile": k_tile,
+    report = {"format": "xilinx-gpu.mapper-report.v1", "backend": backend,
+        "physical_mac_count": lanes if backend == "gemv" else lanes**2,
+        "lanes": lanes, "k_tile": k_tile,
         "batch": len(samples), "layers": reports, "tile_memory": tile_memory,
         "input_clipped_elements": input_clipped,
         "host_activation_peak_bytes": max(x["host_activation_bytes"] for x in reports),
@@ -224,24 +238,29 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False)+"\n", encoding="utf-8")
 
 
-def export_bundle(model, samples, output_dir, lanes=4, k_tile=16):
+def export_bundle(model, samples, output_dir, lanes=4, k_tile=None, backend="gemm"):
     """Write actual packed vector/parameter streams and independent expected outputs."""
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     (root/"report.json").unlink(missing_ok=True)
-    plan = map_model(model, samples, lanes, k_tile)
+    plan = map_model(model, samples, lanes, k_tile, backend)
     compiled, traces, report = plan["compiled"], plan["layers"], plan["report"]
     with (root/"jobs.txt").open("w", encoding="ascii", newline="\n") as jobs, \
             (root/"operands.txt").open("w", encoding="ascii", newline="\n") as operands, \
             (root/"parameters.txt").open("w", encoding="ascii", newline="\n") as parameters, \
             (root/"expected.txt").open("w", encoding="ascii", newline="\n") as expected:
-        jobs.write(f"{len(traces)} {lanes} {k_tile}\n")
+        jobs.write(f"gemv-v1 {len(traces)} {lanes}\n" if backend == "gemv"
+                   else f"{len(traces)} {lanes} {report['k_tile']}\n")
         for layer, trace in zip(compiled["layers"], traces):
             a, b, output = trace["inputs"], layer["weights"], trace["outputs"]
             m, k, n = len(a), len(b), len(b[0])
             jobs.write(f"{m} {n} {k} {int(layer['relu'])}\n")
-            for av, bv in operand_vectors(a, b, lanes):
-                operands.write(f"{_packed(av):0{2*lanes}x} {_packed(bv):0{2*lanes}x}\n")
+            if backend == "gemv":
+                for scalar, bv in operand_beats(a, b, lanes):
+                    operands.write(f"{scalar & 255:02x} {_packed(bv):0{2*lanes}x}\n")
+            else:
+                for av, bv in operand_vectors(a, b, lanes):
+                    operands.write(f"{_packed(av):0{2*lanes}x} {_packed(bv):0{2*lanes}x}\n")
             for r, c in output_coordinates(m, n, lanes):
                 parameters.write(f"{r} {c} {layer['bias'][c]} {layer['multipliers'][c]} {layer['shifts'][c]}\n")
             for row in output:
@@ -258,7 +277,8 @@ def main():
     parser.add_argument("--inputs", type=Path, required=True, help="JSON matrix [batch][input_features]")
     parser.add_argument("--output-dir", type=Path, default=Path("build/npu-mapped"))
     parser.add_argument("--lanes", type=int, default=4)
-    parser.add_argument("--k-tile", type=int, default=16)
+    parser.add_argument("--backend", choices=("gemm", "gemv"), default="gemm")
+    parser.add_argument("--k-tile", type=int, default=None)
     parser.add_argument("--simulate", action="store_true", help="also run Icarus on exported streams")
     args = parser.parse_args()
     try:
@@ -266,7 +286,7 @@ def main():
         (args.output_dir/"report.json").unlink(missing_ok=True)
         source = json.loads(args.model.read_text(encoding="utf-8"))
         inputs = json.loads(args.inputs.read_text(encoding="utf-8"))
-        report = export_bundle(source, inputs, args.output_dir, args.lanes, args.k_tile)
+        report = export_bundle(source, inputs, args.output_dir, args.lanes, args.k_tile, args.backend)
         if args.simulate:
             from npu_mapper_sim import simulate_bundle
             report = simulate_bundle(args.output_dir)

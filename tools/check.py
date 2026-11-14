@@ -138,6 +138,90 @@ def preview(update):
     print("PASS preview: docs/demo.png matches simulated pixels", flush=True)
 
 
+def gemv_acceptance(resources, measurements):
+    """Require complete, numerically equal evidence and the promised resource bounds."""
+    for lanes in (1, 2, 4):
+        for kind in ("raw", "linear"):
+            name = f"gemv_{kind}_{lanes}"
+            mapped = resources.get(name, {})
+            if (mapped.get("dsp48e1") != lanes + (4 if kind == "linear" else 0)
+                    or mapped.get("ramb18e1", 1) or mapped.get("ramb36e1", 1)
+                    or mapped.get("distributed_ram_primitives", {"missing": 1})):
+                raise RuntimeError(f"GEMV resource/memory regression: {name}: {mapped}")
+    if resources["gemv_linear_4"]["dsp48e1"] > resources["stream_linear_2"]["dsp48e1"]:
+        raise RuntimeError("Default GEMV exceeds the 2x2 linear baseline DSP count")
+    configurations, comparisons = {}, []
+    for case in ("mlp_batch1", "tail_batch1"):
+        for mode in ("continuous", "stalled"):
+            group = {}
+            for backend, lanes in (("gemm", 2), ("gemm", 4), ("gemv", 1), ("gemv", 2), ("gemv", 4)):
+                name = f"{case}_{mode}_{backend}_l{lanes}"
+                report = measurements.get(name)
+                if not report or report.get("rtl_validation", {}).get("status") != "passed":
+                    raise RuntimeError(f"Missing/passing RTL evidence required: {name}")
+                cycles = [layer["rtl"]["cycles"] for layer in report["layers"]]
+                if not cycles or any(type(x) is not int or x <= 0 for x in cycles):
+                    raise RuntimeError(f"Invalid GEMV comparison cycles: {name}")
+                group[backend, lanes] = report
+                configurations[name] = {
+                    "backend": backend, "lanes": lanes, "stimulus": mode,
+                    "report": f"gemv/{name}/report.json",
+                    "MAC_count": report["MAC_count"],
+                    "operand_stream_bytes": report["operand_stream_bytes"],
+                    "sum_layer_busy_cycles": sum(cycles),
+                    "layers": [{key: layer[key] for key in ("name", "shape", "rtl")} for layer in report["layers"]]}
+            reference = [x["int8_output"] for x in group["gemm", 2]["layers"]]
+            for report in group.values():
+                if [x["int8_output"] for x in report["layers"]] != reference:
+                    raise RuntimeError(f"Backend integer output mismatch: {case}/{mode}")
+            baseline = sum(x["rtl"]["cycles"] for x in group["gemm", 2]["layers"])
+            vector = sum(x["rtl"]["cycles"] for x in group["gemv", 4]["layers"])
+            if vector > baseline:
+                raise RuntimeError(f"Default GEMV cycle regression: {case}/{mode}: {vector} > {baseline}")
+            comparisons.append({"case": case, "stimulus": mode,
+                                "gemv4_cycles": vector, "gemm2_cycles": baseline,
+                                "gemm2_over_gemv4_cycle_ratio": baseline/vector})
+    return {"configurations": configurations, "resources": resources,
+            "comparisons": comparisons, "integer_mismatches": 0,
+            "cycles_note": "Sum of layer busy cycles, excluding host work and physical transport; no measured frequency",
+            "stimulus_note": "Continuous ready/valid and fixed-seed gaps/backpressure; logical beat streams have different widths",
+            "memory_note": "GEMV accumulator payload only; control, counters, output slot and physical resources reported separately",
+            "hardware_validation": "not performed"}
+
+
+def check_gemv(yosys, sources, stream_resources, models):
+    """Synthesize the vector tops and compare both dataflows on identical models."""
+    resources = {"stream_linear_2": stream_resources["stream_linear_2"]["mapped"]}
+    for lanes in (1, 2, 4):
+        for kind in ("raw", "linear"):
+            top = "npu_gemv_linear_top" if kind == "linear" else "npu_gemv_top"
+            name = f"gemv_{kind}_{lanes}"
+            script = ("read_verilog -sv " + " ".join(sources)
+                      + f"; chparam -set LANES {lanes} {top};"
+                      + f" hierarchy -check -top {top}; synth_xilinx -family xc7 -top {top};"
+                      + f" check -assert; stat; write_json build/{name}.json")
+            run(f"NPU {name} Xilinx synthesis", [yosys, "-Q", "-T", "-p", script],
+                f"npu-{name}-synthesis.log", timeout=300)
+            resources[name] = resource_summary(top, BUILD/f"{name}.json")
+            resources[name]["accumulator_payload_bytes"] = 4*lanes
+            print(f"PASS {name}: {resources[name]}", flush=True)
+    measurements = {}
+    for case, source, inputs in models:
+        for stalls in (False, True):
+            mode = "stalled" if stalls else "continuous"
+            for backend, lanes in (("gemm", 2), ("gemm", 4), ("gemv", 1), ("gemv", 2), ("gemv", 4)):
+                name = f"{case}_{mode}_{backend}_l{lanes}"
+                folder = BUILD/"gemv"/name
+                export_bundle(source, inputs, folder, lanes=lanes, backend=backend)
+                measured = simulate_bundle(folder, stalls=stalls)
+                measurements[name] = measured
+                cycles = sum(layer["rtl"]["cycles"] for layer in measured["layers"])
+                print(f"PASS {name}: {cycles} busy cycles, {measured['operand_stream_bytes']} operand bytes", flush=True)
+    summary = gemv_acceptance(resources, measurements)
+    (BUILD/"npu-gemv-summary.json").write_text(json.dumps(summary, indent=2)+"\n", encoding="utf-8")
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--update-preview", action="store_true", help="refresh the tracked README image")
@@ -145,7 +229,7 @@ def main():
     BUILD.mkdir(exist_ok=True)
     # Never leave a previous successful summary behind after a failed rerun.
     for name in ["check-summary.json", "npu-memory-summary.json", "npu-cycle-summary.json",
-                 "npu-mapper-summary.json"]:
+                 "npu-mapper-summary.json", "npu-gemv-summary.json"]:
         (BUILD / name).unlink(missing_ok=True)
     try:
         iverilog, vvp, yosys = (find_tool(name) for name in ["iverilog", "vvp", "yosys"])
@@ -188,6 +272,10 @@ def main():
                                                              "-Ptb_npu_stream.K_TILE=1"]),
                        ("tb_npu_stream", "stream_linear_3_k7", ["-Ptb_npu_stream.LINEAR=1",
                             "-Ptb_npu_stream.LANES=3", "-Ptb_npu_stream.K_TILE=7"])]
+        for lanes in (1, 2, 4):
+            for linear in (0, 1):
+                npu_benches.append(("tb_npu_gemv", f"gemv_{'linear' if linear else 'raw'}_{lanes}",
+                    [f"-Ptb_npu_gemv.LANES={lanes}", f"-Ptb_npu_gemv.LINEAR={linear}"]))
         for bench, variant, parameters in npu_benches:
             binary = f"build/npu_{variant}.vvp"
             run(f"Compile NPU {variant}", [iverilog, "-g2012", "-Wall", "-s", bench, *parameters,
@@ -286,6 +374,9 @@ def main():
                          "clock_frequency": "not measured; no throughput-in-seconds claim"}
         (BUILD / "npu-memory-summary.json").write_text(json.dumps(memory_summary, indent=2)+"\n", encoding="utf-8")
         (BUILD / "npu-cycle-summary.json").write_text(json.dumps(cycle_summary, indent=2)+"\n", encoding="utf-8")
+        gemv_summary = check_gemv(yosys, npu_sources, stream_resources,
+                                 [("mlp_batch1", model, samples[:1]),
+                                  ("tail_batch1", tail_model, tail_samples[:1])])
         summary = {"python_tests": "passed", "rtl_testbenches": benches,
                    "checked_frames": 3, "pixels_per_frame": 307200,
                    "synthesis": "synth_xilinx -family xc7; check -assert",
@@ -305,6 +396,9 @@ def main():
                                   "live_mlp": "16->32->16; RTL output feeds second layer; host scheduled",
                                   "memory": "npu-memory-summary.json", "cycles": "npu-cycle-summary.json",
                                   "resources": stream_resources},
+                   "npu_gemv": {"summary": "npu-gemv-summary.json",
+                                "mapped_configurations": len(gemv_summary["configurations"]),
+                                "lanes_tested": [1, 2, 4], "integer_mismatches": 0},
                    "npu_mapper": {"summary": "npu-mapper-summary.json",
                                   "rtl_configurations": list(mapper_reports), "integer_mismatches": 0,
                                   "float_reference": "Python binary64", "training": "not performed"}}

@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,7 +40,11 @@ jobs:
             build/npu-cycle-summary.json
             build/npu-stream-*-cycles.txt
             build/npu-mapper-summary.json
+            build/npu-gemv-summary.json
             build/mapper/**/*.json
             build/mapper/**/*.log
             build/mapper/**/*.txt
+            build/gemv/**/*.json
+            build/gemv/**/*.log
+            build/gemv/**/*.txt
           retention-days: 14

@@ -270,6 +270,43 @@ python tools/check.py
 
 统一检查使用确定性未训练16→32→16模型的batch=1/3，以及5→7→3的batch=3尾块模型，均验证LANES=2/4。`build/npu-mapper-summary.json`汇总六组配置，`build/mapper/`保留逐组完整证据，CI上传相同产物。`sum_layer_busy_cycles`只相加各层busy周期，不含层间主机处理、文件I/O或真实设备传输；没有据此推算毫秒、功耗或上板吞吐。
 
+## 单样本 GEMV 接口
+
+`npu_gemv_top` 计算 `C[1,N] = A[1,K] × B[K,N]`，输出 INT32；`npu_gemv_linear_top` 增加与现有量化线性层相同的 bias、ties-away 缩放、可选 ReLU 和 INT8 饱和。LANES 默认 4，表示并行输出通道数，K 维每拍计算一个元素。本后端是独立 RTL，原有矩阵与流式脉动阵列接口继续可用。
+
+### 存储与完整调用周期
+
+1. 空闲时握手 `cmd_valid/cmd_ready`，锁存非零 16 位 `cmd_n/cmd_k`；M 隐含为 1，量化顶层同时锁存 `cmd_relu`。
+2. 对输出组 `base=0,LANES,2×LANES,…`，按 k=0…K−1 发送操作数。每次 `operand_valid && operand_ready` 接收一个 signed INT8 `a_scalar` 和 `LANES×8` 位 `b_vector`，低字节为 lane0。激活广播，各 lane 累加 `A[k]×B[k,base+lane]`。
+3. K 项到齐后依次输出该组真实通道；尾组超出 N 的 lane 由硬件屏蔽。输出期间不接收下一组操作数，因此不需要结果组队列。量化参数与真实结果一一对应，无整层参数表。
+4. 每组结束清零累加器，再由外部重放下一组所需的 K 个激活。最终结果被接收后产生单周期 `done`，下一命令才可进入。
+
+原始数据通路仅保留 `4×LANES` 字节 INT32 部分和，不保存 A/B 操作数。默认数值 16 字节不能当成完整核心存储：控制寄存器、八个 64 位计数器、输出索引和量化输出保持槽另计；物理 LUT/FF/DSP 以综合报告为准。没有实现从外部存储器或串口向本接口供数的硬件。
+
+每组重放输入是省存储的代价。设 `G=ceil(N/LANES)`，则操作数握手数 `G×K`，激活流量 `G×K` 字节，权重流量 `G×K×LANES` 字节（含尾 lane 填充），有效 MAC 数 `N×K`。整层独有权重仍为 `N×K` 字节。串行链路封包、文件体积和控制开销不在这些逻辑负载中。
+
+### 端口、停顿与错误
+
+除操作数变为 `a_scalar/b_vector`、描述符没有 `cmd_m`，命令、结果、参数及八个统计端口沿用流式接口命名。`out_row` 固定为 0，`out_col` 从 0 递增，`out_last` 仅标记最后一个真实结果。未完成期间 `busy=1`、`cmd_ready=0`。输出被反压时 data、row、col、last 和 valid 保持稳定；上游也必须在 valid 且未 ready 时保持数据。
+
+同步高有效 `rst` 中止任务并清除有效状态。零维度命令产生错误脉冲且不启动；计算中出现的命令不握手。量化参数要求 multiplier 为正 INT31、shift≤31；非法参数产生错误脉冲，不消耗对应 INT32 结果，可补发正确参数。bias 加法扩展到 33 位，乘法保留 64 位；量化语义与 Python 整数参考一致。
+
+原始核心的 `stat_load_cycles/stat_compute_cycles/stat_overlap_cycles` 都统计接收并计算操作数的拍数；没有独立装载阶段，`stat_buffer_stall_cycles=0`。`stat_input_wait_cycles` 统计可接收但无输入的拍数，`stat_output_stall_cycles` 统计结果等待。量化顶层的总周期包含参数等待和输出排空。计数器非可加，MAC 只累计真实通道，任务结束后冻结。
+
+### 映射、仿真与验收
+
+```sh
+python tools/npu_mapper.py --backend gemv --lanes 4 --model examples/npu/tiny_mlp.json --inputs examples/npu/tiny_mlp_input_single.json --output-dir build/mapped-gemv --simulate
+```
+
+模型源格式、量化参数选择和整数参考不变；GEMV 要求 batch=1，显式指定 `--k-tile` 会报错。GEMM 仍为默认后端且格式兼容。GEMV 的 `jobs.txt` 首行为 `gemv-v1 层数 LANES`，随后每层为 `1 N K relu`；`operands.txt` 每行为两位十六进制激活字节与 `2×LANES` 位十六进制权重向量。参数按输出列递增，其他文件含义不变。报告中的 `physical_mac_count` 为 LANES，GEMM 则为 LANES²；它不包含后处理缩放乘法器。
+
+`simulate_bundle(output_dir, stalls=False)` 使用连续供数与随时就绪的结果接口，默认 `stalls=True` 使用固定种子反压及确定性输入/参数间断。两个后端在相同模式下运行，不把总线宽度不同的周期结果当作相同物理链路下的时延。多层任务继续使用实际捕获的 RTL 激活，导出流损坏、额外数据或数值不一致均失败。
+
+统一入口增加 LANES=1/2/4 的原始/量化测试，覆盖尾组、极值、量化边界、完整 N/K=65535、停顿、错误重试与中断复位。综合要求原始核心 DSP 数等于 LANES，量化顶层加四个缩放 DSP，均无 BRAM/LUTRAM。两种模型在两种停顿模式下比较 GEMM 2/4 和 GEMV 1/2/4；默认 GEMV4 的 DSP 和总忙碌周期不得超过 GEMM2 基线，所有输出必须相同。汇总保存到 `build/npu-gemv-summary.json`，完整报告位于 `build/gemv/`，CI 上传相同证据。
+
+这些模型仍未训练；没有据仿真周期推断上板频率、功耗、真实吞吐或任务精度。
+
 ## 设计参考与 JEPA 方向
 
 本版代码独立实现，只借鉴以下设计思路，没有移植这些项目的源码，也没有引用其性能作为本项目指标：

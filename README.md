@@ -82,6 +82,29 @@ python tools/check.py                     # 整体功能、计数器对照与综
 
 仿真中的两层 MLP 由测试台调度，第二层使用第一层的实际 RTL 输出。当前只实现一个 Tile；扫描中的多 Tile 数据仅是理论估算。batch=1 的矩阵形状会闲置阵列行，因此报告有效 MAC/周期和利用率，不把 PE 峰值当作应用性能。新接口、流量公式、计数器含义见 [NPU 文档](docs/npu.md#低存储流式接口)。
 
+## 单样本极低存储 GEMV
+
+`npu_gemv_top` 和 `npu_gemv_linear_top` 为 **batch=1** 提供独立向量后端。每拍一个 INT8 激活广播到 `LANES` 个输出通道，配合一组权重并行乘加；输出组之间由外部重放输入。默认 4 路 INT32 累加负载为 **16 字节**，没有完整输入、权重或分块 RAM。这个数字只包含累加器，不代表整个核心：控制、计数器和量化输出寄存器另计。
+
+```sh
+python tools/npu_mapper.py --backend gemv --lanes 4 --model examples/npu/tiny_mlp.json --inputs examples/npu/tiny_mlp_input_single.json --output-dir build/mapped-gemv --simulate
+python tools/check.py
+```
+
+输入维度必须为 `[1][K]`；GEMV 不使用 `--k-tile`。默认后端仍是 `gemm`，旧命令和导出格式保持兼容。两种后端采用相同的量化数值规则，逐层连接实际 RTL 激活；主机仍负责层调度和数据重放。
+
+统一检查对 LANES=1/2/4 进行原始和量化 GEMV 仿真与综合，并用两种模型、连续输入和固定种子停顿，对比 GEMV 与 2×2/4×4 GEMM，共 20 组模型运行。结果见 `build/npu-gemv-summary.json` 与 CI 产物；周期不包含主机中转或实际传输，也未换算为工作频率或功耗。详见 [GEMV 接口与数据流](docs/npu.md#单样本-gemv-接口)。
+
+2026-11-14 本地 Yosys 0.66 / Icarus 对同一未训练 `16→32→16`、batch=1 模型的结果（均含量化后处理）：
+
+| 后端 | 总 DSP48E1 | A/B/C 或部分和负载（字节） | 连续供数忙碌周期 | 带停顿忙碌周期 | 操作数流量（字节） |
+|---|---:|---:|---:|---:|---:|
+| GEMM LANES=2 | 8 | 144 | 786 | 837 | 2048 |
+| GEMM LANES=4 | 20 | 320 | 498 | 552 | 2048 |
+| GEMV LANES=4 | 8 | 16 | 306 | 455 | 1280 |
+
+GEMV4 原始/量化顶层分别使用 4/8 个 DSP、651/1524 个逻辑 LUT 原语、518/692 个触发器，均为零 BRAM/LUTRAM。量化后处理的 4 个 DSP 已计入表中总量；负载字节不含控制、统计等状态。相比 GEMM2，连续场景周期比约 2.57、停顿场景约 1.84；这是不同宽度逻辑流下的仿真比较，不是同一物理链路上的实测加速比。
+
 ## 量化模型到流式 NPU 的映射器 v0
 
 `tools/npu_mapper.py` 将**串接的线性层 JSON**转换成现有 RTL 可消费的配对 A/B 向量和逐结果参数流：逐通道 INT8 权重、INT32 bias、正整数乘数/右移、可选 ReLU。激活 input/output scale 显式指定，权重 scale 可逐通道指定或按最大绝对值自动计算；所有零点固定为0。工具只依赖 Python 标准库，`--simulate` 才需要 Icarus Verilog。
@@ -211,6 +234,7 @@ CRC 多项式 `0x07`，初值 `0x00`，不反射，最终异或 `0x00`；标准�
 - 流式 NPU：每配置 31 组矩阵（包含确定性舍入/饱和和两层 MLP），原始/量化路径均测试 4×4、2×2；另测 1×1/K_TILE=1 与 3×3/K_TILE=7。覆盖跨 K 块、输入间断、输出反压、非法参数重试、复位、完整 K/M/N=65535 边界和周期/流量模型对照。
 - 流式综合：分别检查原始/量化、4×4/2×2 四种配置，要求 DSP、分布式 RAM 和零 BRAM 映射；运行 `check -assert`。
 - 模型映射器：数值/格式/流布局测试、半整数邻近值和尺度溢出回归；6组模型配置直接消费导出流并串接实际 RTL 激活，逐项比较整数结果，核查周期，并检查损坏流会失败且不会保留通过状态。
+- GEMV：原始/量化、LANES=1/2/4 共六配置，每配置 13 组定向/随机任务及非法命令、复位检查；另有 20 组映射模型对比与六组资源综合，要求数值一致、无操作数 RAM、DSP 随并行度线性增长，并检查默认配置的周期/DSP 预算。
 
 2026-11-11 本地验证使用 Icarus Verilog 13.0、Yosys 0.66 和 Python 3.13。GPU 映射约为 **261 个 LUT、398 个触发器、0 BRAM、0 DSP**；默认 4×4 NPU GEMM 映射到 **16 个 DSP48E1、8 个 RAMB18E1**，带量化线性层的顶层映射到 **20 个 DSP48E1、8 个 RAMB18E1**。不同综合版本和布局结果可能变化。完整统计见本地 `build/` 或 CI 验证产物。
 
@@ -259,9 +283,9 @@ A small synthesizable GPU/NPU learning project for Xilinx 7-series FPGAs. The GP
 
 The new streaming tops retain only a bounded tile working set: 320 bytes of logical A/B/C payload at LANES=4, K_TILE=16, with ping-pong LUTRAM, K-chunk accumulation and streamed quantization parameters. Control, pipelines and counters are reported separately. Tests chain a 16→32→16 INT8 MLP using actual RTL intermediate outputs; layer scheduling is host-side. One Tile is implemented; multi-Tile sweep figures are theoretical.
 
-The v0 Python mapper accepts sequential floating-point linear layers as JSON, applies zero-point-zero per-channel weight quantization and explicit activation scales, and exports the actual operand/parameter streams. `--simulate` feeds those streams into the unchanged RTL and chains captured intermediate activations. Reports separate binary64-reference quantization error from exact integer RTL agreement, and logical activation payload from actual host memory. Examples are deterministic and untrained; framework import, automatic calibration and trained-model execution are future work.
+The Python mapper accepts sequential floating-point linear layers as JSON, applies zero-point-zero per-channel weight quantization and explicit activation scales, and exports the actual operand/parameter streams. The default `gemm` backend retains its existing format; `--backend gemv` selects a batch-one scalar-broadcast vector core with streamed weights and no operand RAM. At four lanes its INT32 accumulator payload is 16 bytes, excluding control, counters and the quantized output register. `--simulate` feeds exported streams into the selected RTL and chains captured intermediate activations. Reports separate binary64-reference quantization error from exact integer RTL agreement, and logical activation payload from actual host memory. Examples are deterministic and untrained; framework import, automatic calibration and trained-model execution are future work.
 
-Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, legacy GEMM/linear regressions, 31 streaming jobs per configuration, full 16-bit dimension edges, RTL/model cycle counters, and seven Xilinx top-level syntheses. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
+Run `python tools/check.py` with Python 3.10+, Icarus Verilog and Yosys. It checks Python models, GPU benches and three video frames, legacy GEMM/linear regressions, 31 streaming jobs per configuration, full 16-bit dimension edges, RTL/model cycle counters, and thirteen Xilinx synthesis configurations. GEMV checks add six raw/linear bench configurations and twenty mapped model comparisons with and without stalls. The README image comes from the simulated pixel stream. See [NPU documentation](docs/npu.md) for interfaces and references. Board integration, Vivado timing closure and trained JEPA execution remain future work.
 
 ## 许可证
 
